@@ -5,6 +5,7 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <tuple>
 #include <vector>
 
 namespace mockup::detail
@@ -48,8 +49,18 @@ namespace mockup::detail
   template <typename... Args>
   struct invocation
   {
+    std::function<bool(std::function<bool(std::decay_t<Args> const&...)> const&)> match;
     std::size_t order;
-    std::tuple<std::decay_t<Args>...> arguments;
+
+    template <typename Arguments>
+    explicit invocation(Arguments&& args, std::size_t order)
+    : match([args = std::forward<Arguments>(args)](
+                std::function<bool(std::decay_t<Args> const&...)> const& match) {
+      return std::apply(match, args);
+    })
+    , order(order)
+    {
+    }
   };
 
   template <typename>
@@ -58,13 +69,14 @@ namespace mockup::detail
   template <typename R, typename... Args>
   struct action<R(Args...)>
   {
-    std::function<bool(Args...)> match;
+    std::function<bool(std::decay_t<Args> const&...)> match;
     std::function<R(Args...)> function;
 
     template <typename Arguments>
     explicit action(Arguments&& arguments, std::function<R(Args...)> function)
-    : match([arguments = std::forward<Arguments>(arguments)](auto const&... args) {
-      return std::tie(args...) == arguments;
+    : match([arguments =
+                 std::forward<Arguments>(arguments)](std::decay_t<Args> const&... args) {
+      return arguments == std::tie(args...);
     })
     , function(std::move(function))
     {
@@ -80,19 +92,33 @@ namespace mockup::detail
     std::vector<invocation<Args...>> invocations;
     std::vector<action<R(Args...)>> actions;
 
-    R operator()(Args... args)
+    member_function_instance()
     {
-      R result{};
+      if constexpr (std::is_default_constructible_v<std::decay_t<R>>)
+      {
+        actions.emplace_back(wildcard, [r = std::decay_t<R>()](Args...) mutable -> R {
+          return std::forward<R>(r);
+        });
+      }
+    }
+
+    template <typename... FuncArgs>
+    R operator()(FuncArgs&&... args)
+    {
+      invocations.push_back(invocation<Args...>{std::make_tuple(args...), ++order});
       for (auto it = std::rbegin(actions); it != std::rend(actions); ++it)
       {
         if (it->match(args...))
         {
-          result = it->function(args...);
-          break;
+          return it->function(std::forward<FuncArgs>(args)...);
         }
       }
-      invocations.push_back({++order, std::make_tuple(std::forward<Args>(args)...)});
-      return result;
+      if constexpr (!std::is_void_v<R>)
+      {
+        throw std::runtime_error(
+            "no action registered for member function with non-default constructible "
+            "return type");
+      }
     }
   };
 
@@ -186,6 +212,16 @@ namespace mockup::detail
     }
     return it->second;
   }
+
+  struct converts_to_any
+  {
+    template <typename T>
+    operator T()
+    {
+      return {};
+    }
+  };
+
 } // namespace mockup::detail
 
 namespace mockup
@@ -245,18 +281,23 @@ namespace mockup
       auto& instance = detail::get_member_function_instance<MemberFunction>(&m_mock);
       return [&, args = std::make_tuple(std::forward<Args>(args)...)](
                  auto&& function) mutable {
+        static_assert(
+            std::is_invocable_v<decltype(function), Args&&...>,
+            "function object cannot be called with required arguments");
         instance.actions.emplace_back(
             std::move(args), std::forward<decltype(function)>(function));
       };
     }
 
     template <auto MemberFunction, typename... Args>
-    bool invoked(Args&&... args)
+    bool invoked(Args const&... args)
     {
       auto& instance = detail::get_member_function_instance<MemberFunction>(&m_mock);
       for (auto& invocation : instance.invocations)
       {
-        if (invocation.arguments == std::tie(args...))
+        if (invocation.match([expected = std::tie(args...)](auto const&... args) {
+              return expected == std::tie(args...);
+            }))
         {
           return true;
         }
@@ -265,7 +306,7 @@ namespace mockup
     }
 
     template <auto MemberFunction, typename... Args>
-    bool invoked(sequence& seq, Args&&... args)
+    bool invoked(sequence& seq, Args const&... args)
     {
       auto& instance = detail::get_member_function_instance<MemberFunction>(&m_mock);
       auto it = std::upper_bound(
@@ -277,7 +318,9 @@ namespace mockup
           });
       for (; it != std::end(instance.invocations); ++it)
       {
-        if (it->arguments == std::tie(args...))
+        if (it->match([expected = std::tie(args...)](Args const&... args) {
+              return expected == std::tie(args...);
+            }))
         {
           seq.order = it->order;
           return true;
@@ -290,6 +333,9 @@ namespace mockup
   template <auto MemberFunction, typename Mock, typename... Args>
   decltype(auto) invoke(Mock const& mock, Args&&... args)
   {
+    static_assert(
+        (... && std::is_copy_constructible_v<std::decay_t<Args>>),
+        "all arguments must be copyable");
     return detail::get_member_function_instance<MemberFunction>(&mock)(
         std::forward<Args>(args)...);
   }
@@ -315,6 +361,18 @@ namespace mockup
       return true;
     }
 
+    template <typename T>
+    bool operator!=(wildcard_t, T const&)
+    {
+      return false;
+    }
+
+    template <typename T>
+    bool operator!=(T const&, wildcard_t)
+    {
+      return false;
+    }
+
     constexpr wildcard_t wildcard{0};
     constexpr wildcard_t _{0};
 
@@ -333,9 +391,190 @@ namespace mockup
         }
       };
     }
+
+    template <typename... En>
+    auto throw_(En&&... en)
+    {
+      std::array<std::common_type_t<En...>, sizeof...(En)> r{std::forward<En>(en)...};
+      return [r = std::move(r),
+              i = std::size_t()](auto&&...) mutable -> detail::converts_to_any {
+        if (i + 1 < r.size())
+        {
+          throw r[i++];
+        }
+        else
+        {
+          throw r[i];
+        }
+      };
+    }
+
+    template <typename T>
+    class reference
+    {
+    private:
+      std::decay_t<T>* m_value;
+
+    public:
+      explicit reference(T value)
+      : m_value(&value)
+      {
+      }
+
+      operator T const&() const&
+      {
+        return *m_value;
+      }
+
+      operator T&() &
+      {
+        return *m_value;
+      }
+
+      operator T const &&() const&&
+      {
+        return std::move(*m_value);
+      }
+
+      operator T &&() &&
+      {
+        return std::move(*m_value);
+      }
+
+      bool operator==(std::decay_t<T> const& other) const
+      {
+        return *m_value == other;
+      }
+    };
+
+    template <typename T>
+    auto ref(T&& t)
+    {
+      return reference<T&&>(std::forward<T>(t));
+    };
   } // namespace helpers
 
   using namespace helpers;
+
+  template <typename>
+  struct overload_t;
+
+  template <typename R, typename... Args>
+  struct overload_t<R(Args...)>
+  {
+    explicit constexpr overload_t(int)
+    {
+    }
+
+    template <typename T>
+    constexpr auto operator()(R (T::*m)(Args...)) const
+    {
+      return m;
+    }
+  };
+
+  template <typename R, typename... Args>
+  struct overload_t<R(Args...) const>
+  {
+    explicit constexpr overload_t(int)
+    {
+    }
+
+    template <typename T>
+    constexpr auto operator()(R (T::*m)(Args...) const) const
+    {
+      return m;
+    }
+  };
+
+  template <typename F>
+  inline constexpr overload_t<F> overload{0};
+
+  template <typename... Args, typename R, typename T>
+  constexpr auto const_(R (T::*m)(Args...) const)
+  {
+    return m;
+  }
+
+  template <typename... Args, typename R, typename T>
+  constexpr auto non_const(R (T::*m)(Args...))
+  {
+    return m;
+  }
+
+  template <typename P>
+  class predicate_t
+  {
+  private:
+    P m_predicate;
+
+  public:
+    template <typename F>
+    explicit predicate_t(F&& f)
+    : m_predicate(std::forward<F>(f))
+    {
+    }
+
+    template <typename T>
+    bool operator==(T const& t) const
+    {
+      return m_predicate(t);
+    }
+  };
+
+  template <typename P>
+  auto predicate(P&& p)
+  {
+    return predicate_t<std::decay_t<P>>(std::forward<P>(p));
+  }
+
+  template <typename T>
+  auto equal_to(T&& t)
+  {
+    return predicate([t = std::forward<T>(t)](auto const& x) {
+      return x == t;
+    });
+  }
+
+  template <typename T>
+  auto not_equal_to(T&& t)
+  {
+    return predicate([t = std::forward<T>(t)](auto const& x) {
+      return x != t;
+    });
+  }
+
+  template <typename T>
+  auto less_than(T&& t)
+  {
+    return predicate([t = std::forward<T>(t)](auto const& x) {
+      return x < t;
+    });
+  }
+
+  template <typename T>
+  auto less_than_or_equal_to(T&& t)
+  {
+    return predicate([t = std::forward<T>(t)](auto const& x) {
+      return x <= t;
+    });
+  }
+
+  template <typename T>
+  auto greater_than(T&& t)
+  {
+    return predicate([t = std::forward<T>(t)](auto const& x) {
+      return x > t;
+    });
+  }
+
+  template <typename T>
+  auto greater_than_or_equal_to(T&& t)
+  {
+    return predicate([t = std::forward<T>(t)](auto const& x) {
+      return x >= t;
+    });
+  }
 } // namespace mockup
 
 #endif // MOCKUP_MOCKUP_HPP
